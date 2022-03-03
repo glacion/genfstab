@@ -6,6 +6,7 @@ shopt -s extglob
 declare -A pseudofs_types=([anon_inodefs]=1
                            [autofs]=1
                            [bdev]=1
+                           [bpf]=1
                            [binfmt_misc]=1
                            [cgroup]=1
                            [cgroup2]=1
@@ -16,6 +17,7 @@ declare -A pseudofs_types=([anon_inodefs]=1
                            [devpts]=1
                            [devtmpfs]=1
                            [dlmfs]=1
+                           [efivarfs]=1
                            [fuse.gvfs-fuse-daemon]=1
                            [fusectl]=1
                            [hugetlbfs]=1
@@ -50,9 +52,57 @@ declare -A fsck_types=([cramfs]=1
 
 out() { printf "$1 $2\n" "${@:3}"; }
 error() { out "==> ERROR:" "$@"; } >&2
+warning() { out "==> WARNING:" "$@"; } >&2
 msg() { out "==>" "$@"; }
 msg2() { out "  ->" "$@";}
 die() { error "$@"; exit 1; }
+
+ignore_error() {
+  "$@" 2>/dev/null
+  return 0
+}
+
+in_array() {
+  local i
+  for i in "${@:2}"; do
+    [[ $1 = "$i" ]] && return 0
+  done
+  return 1
+}
+
+chroot_add_mount() {
+  mount "$@" && CHROOT_ACTIVE_MOUNTS=("$2" "${CHROOT_ACTIVE_MOUNTS[@]}")
+}
+
+chroot_maybe_add_mount() {
+  local cond=$1; shift
+  if eval "$cond"; then
+    chroot_add_mount "$@"
+  fi
+}
+
+chroot_setup() {
+  CHROOT_ACTIVE_MOUNTS=()
+  [[ $(trap -p EXIT) ]] && die '(BUG): attempting to overwrite existing EXIT trap'
+  trap 'chroot_teardown' EXIT
+
+  chroot_add_mount proc "$1/proc" -t proc -o nosuid,noexec,nodev &&
+  chroot_add_mount sys "$1/sys" -t sysfs -o nosuid,noexec,nodev,ro &&
+  ignore_error chroot_maybe_add_mount "[[ -d '$1/sys/firmware/efi/efivars' ]]" \
+      efivarfs "$1/sys/firmware/efi/efivars" -t efivarfs -o nosuid,noexec,nodev &&
+  chroot_add_mount udev "$1/dev" -t devtmpfs -o mode=0755,nosuid &&
+  chroot_add_mount devpts "$1/dev/pts" -t devpts -o mode=0620,gid=5,nosuid,noexec &&
+  chroot_add_mount shm "$1/dev/shm" -t tmpfs -o mode=1777,nosuid,nodev &&
+  chroot_add_mount /run "$1/run" --bind &&
+  chroot_add_mount tmp "$1/tmp" -t tmpfs -o mode=1777,strictatime,nodev,nosuid
+}
+
+chroot_teardown() {
+  if (( ${#CHROOT_ACTIVE_MOUNTS[@]} )); then
+    umount "${CHROOT_ACTIVE_MOUNTS[@]}"
+  fi
+  unset CHROOT_ACTIVE_MOUNTS
+}
 
 try_cast() (
   _=$(( $1#$2 ))
@@ -197,7 +247,6 @@ dm_name_for_devnode() {
   else
     # don't leave the caller hanging, just print the original name
     # along with the failure.
-    print '%s' "$1"
     error 'Failed to resolve device mapper name for: %s' "$1"
   fi
 }
@@ -286,11 +335,12 @@ usage() {
 usage: ${0##*/} [options] root
 
   Options:
-    -f FILTER      Restrict output to mountpoints matching the prefix FILTER
+    -f <filter>    Restrict output to mountpoints matching the prefix FILTER
     -L             Use labels for source identifiers (shortcut for -t LABEL)
     -p             Exclude pseudofs mounts (default behavior)
     -P             Include pseudofs mounts
-    -t TAG         Use TAG for source identifiers
+    -t <tag>       Use TAG for source identifiers (TAG should be one of: LABEL,
+                      UUID, PARTLABEL, PARTUUID)
     -U             Use UUIDs for source identifiers (shortcut for -t UUID)
 
     -h             Print this help message
@@ -369,23 +419,19 @@ findmnt -Recvruno SOURCE,TARGET,FSTYPE,OPTIONS,FSROOT "$root" |
     pass=0
   fi
 
-  if [[ $fsroot != / ]]; then
-    if [[ $fstype = btrfs ]]; then
-      opts+=,subvol=${fsroot#/}
-    else
-      # it's a bind mount
-      src=$(findmnt -funcevo TARGET "$src")$fsroot
-      if [[ $src -ef $target ]]; then
-        # hrmm, this is weird. we're probably looking at a file or directory
-        # that was bound into a chroot from the host machine. Ignore it,
-        # because this won't actually be a valid mount. Worst case, the user
-        # just re-adds it.
-        continue
-      fi
-      fstype=none
-      opts+=,bind
-      pass=0
+  if [[ $fsroot != / && $fstype != btrfs ]]; then
+    # it's a bind mount
+    src=$(findmnt -funcevo TARGET "$src")$fsroot
+    if [[ $src -ef $target ]]; then
+      # hrmm, this is weird. we're probably looking at a file or directory
+      # that was bound into a chroot from the host machine. Ignore it,
+      # because this won't actually be a valid mount. Worst case, the user
+      # just re-adds it.
+      continue
     fi
+    fstype=none
+    opts+=,bind
+    pass=0
   fi
 
   # filesystem quirks
@@ -418,7 +464,7 @@ done
 
   while read -r device type _ _ prio; do
     options=defaults
-    if [[ $prio != -1 ]]; then
+    if (( prio >= 0 )); then
       options+=,pri=$prio
     fi
 
@@ -426,7 +472,7 @@ done
     [[ $device = *'\040(deleted)' ]] && continue
 
     if [[ $type = file ]]; then
-      printf '%-20s' "$device"
+      printf '%-20s' "${device#${root%/}}"
     elif [[ $device = /dev/dm-+([0-9]) ]]; then
       # device mapper doesn't allow characters we need to worry
       # about being mangled, and it does the escaping of dashes
