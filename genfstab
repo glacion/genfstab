@@ -4,10 +4,12 @@ shopt -s extglob
 
 # generated from util-linux source: libmount/src/utils.c
 declare -A pseudofs_types=([anon_inodefs]=1
+                           [apparmorfs]=1
                            [autofs]=1
                            [bdev]=1
-                           [bpf]=1
+                           [binder]=1
                            [binfmt_misc]=1
+                           [bpf]=1
                            [cgroup]=1
                            [cgroup2]=1
                            [configfs]=1
@@ -17,32 +19,56 @@ declare -A pseudofs_types=([anon_inodefs]=1
                            [devpts]=1
                            [devtmpfs]=1
                            [dlmfs]=1
+                           [dmabuf]=1
+                           [drm]=1
                            [efivarfs]=1
+                           [fuse]=1
+                           [fuse.archivemount]=1
+                           [fuse.avfsd]=1
+                           [fuse.dumpfs]=1
+                           [fuse.encfs]=1
                            [fuse.gvfs-fuse-daemon]=1
+                           [fuse.gvfsd-fuse]=1
+                           [fuse.lxcfs]=1
+                           [fuse.rofiles-fuse]=1
+                           [fuse.vmware-vmblock]=1
+                           [fuse.xwmfs]=1
                            [fusectl]=1
                            [hugetlbfs]=1
+                           [ipathfs]=1
                            [mqueue]=1
                            [nfsd]=1
                            [none]=1
+                           [nsfs]=1
+                           [overlay]=1
                            [pipefs]=1
                            [proc]=1
                            [pstore]=1
                            [ramfs]=1
+                           [resctrl]=1
                            [rootfs]=1
                            [rpc_pipefs]=1
                            [securityfs]=1
+                           [selinuxfs]=1
+                           [smackfs]=1
                            [sockfs]=1
                            [spufs]=1
                            [sysfs]=1
-                           [tmpfs]=1)
+                           [tmpfs]=1
+                           [tracefs]=1
+                           [vboxsf]=1
+                           [virtiofs]=1)
 
 # generated from: pkgfile -vbr '/fsck\..+' | awk -F. '{ print $NF }' | sort
-declare -A fsck_types=([cramfs]=1
+declare -A fsck_types=([btrfs]=0    # btrfs doesn't need a regular fsck utility
+                       [cramfs]=1
+                       [erofs]=1
                        [exfat]=1
                        [ext2]=1
                        [ext3]=1
                        [ext4]=1
-                       [ext4dev]=1
+                       [f2fs]=1
+                       [fat]=1
                        [jfs]=1
                        [minix]=1
                        [msdos]=1
@@ -50,59 +76,10 @@ declare -A fsck_types=([cramfs]=1
                        [vfat]=1
                        [xfs]=1)
 
+# shellcheck disable=SC2059 # $1 and $2 can contain the printf modifiers
 out() { printf "$1 $2\n" "${@:3}"; }
 error() { out "==> ERROR:" "$@"; } >&2
-warning() { out "==> WARNING:" "$@"; } >&2
-msg() { out "==>" "$@"; }
-msg2() { out "  ->" "$@";}
 die() { error "$@"; exit 1; }
-
-ignore_error() {
-  "$@" 2>/dev/null
-  return 0
-}
-
-in_array() {
-  local i
-  for i in "${@:2}"; do
-    [[ $1 = "$i" ]] && return 0
-  done
-  return 1
-}
-
-chroot_add_mount() {
-  mount "$@" && CHROOT_ACTIVE_MOUNTS=("$2" "${CHROOT_ACTIVE_MOUNTS[@]}")
-}
-
-chroot_maybe_add_mount() {
-  local cond=$1; shift
-  if eval "$cond"; then
-    chroot_add_mount "$@"
-  fi
-}
-
-chroot_setup() {
-  CHROOT_ACTIVE_MOUNTS=()
-  [[ $(trap -p EXIT) ]] && die '(BUG): attempting to overwrite existing EXIT trap'
-  trap 'chroot_teardown' EXIT
-
-  chroot_add_mount proc "$1/proc" -t proc -o nosuid,noexec,nodev &&
-  chroot_add_mount sys "$1/sys" -t sysfs -o nosuid,noexec,nodev,ro &&
-  ignore_error chroot_maybe_add_mount "[[ -d '$1/sys/firmware/efi/efivars' ]]" \
-      efivarfs "$1/sys/firmware/efi/efivars" -t efivarfs -o nosuid,noexec,nodev &&
-  chroot_add_mount udev "$1/dev" -t devtmpfs -o mode=0755,nosuid &&
-  chroot_add_mount devpts "$1/dev/pts" -t devpts -o mode=0620,gid=5,nosuid,noexec &&
-  chroot_add_mount shm "$1/dev/shm" -t tmpfs -o mode=1777,nosuid,nodev &&
-  chroot_add_mount /run "$1/run" --bind &&
-  chroot_add_mount tmp "$1/tmp" -t tmpfs -o mode=1777,strictatime,nodev,nosuid
-}
-
-chroot_teardown() {
-  if (( ${#CHROOT_ACTIVE_MOUNTS[@]} )); then
-    umount "${CHROOT_ACTIVE_MOUNTS[@]}"
-  fi
-  unset CHROOT_ACTIVE_MOUNTS
-}
 
 try_cast() (
   _=$(( $1#$2 ))
@@ -221,10 +198,10 @@ optstring_prepend_option() {
 }
 
 optstring_get_option() {
-  local opts o
+  local _opts o
 
-  IFS=, read -ra opts <<<"${!1}"
-  for o in "${opts[@]}"; do
+  IFS=, read -ra _opts <<<"${!1}"
+  for o in "${_opts[@]}"; do
     if optstring_match_option "$2" "$o"; then
       declare -g "$o"
       return 0
@@ -314,11 +291,22 @@ optstring_apply_quirks() {
   fi
 
   case $fstype in
+    btrfs)
+      # Having only one of subvol= and subvolid= is enough for mounting a btrfs subvolume
+      # And having subvolid= set prevents things like 'snapper rollback' to work, as it
+      # updates the subvolume in-place, leaving subvol= unchanged with a different subvolid.
+      if optstring_has_option "$varname" subvol; then
+        optstring_remove_option "$varname" subvolid
+      fi
+      ;;
     f2fs)
-      # These are Kconfig options for f2fs. Kernels supporting the options will
-      # only provide the negative versions of these (e.g. noacl), and vice versa
+      # These are build-time or runtime-unchangeable options for f2fs.
+      # The former means that kernels supporting the options will only
+      # provide the negative versions of these (e.g. noacl), and vice versa
       # for kernels without support.
-      optstring_remove_option "$varname" noacl,acl,nouser_xattr,user_xattr
+      # The latter means that the options can only be specified/changed
+      # during the initial mount but not remount.
+      optstring_remove_option "$varname" noacl,acl,nouser_xattr,user_xattr,atgc
       ;;
     vfat)
       # Before Linux v3.8, "cp" is prepended to the value of the codepage.
@@ -394,8 +382,7 @@ if ! mountpoint -q "$root"; then
 fi
 
 # handle block devices
-findmnt -Recvruno SOURCE,TARGET,FSTYPE,OPTIONS,FSROOT "$root" |
-    while read -r src target fstype opts fsroot; do
+while read -r src target fstype opts fsroot; do
   if (( !pseudofs )) && fstype_is_pseudofs "$fstype"; then
     continue
   fi
@@ -422,6 +409,7 @@ findmnt -Recvruno SOURCE,TARGET,FSTYPE,OPTIONS,FSROOT "$root" |
   if [[ $fsroot != / && $fstype != btrfs ]]; then
     # it's a bind mount
     src=$(findmnt -funcevo TARGET "$src")$fsroot
+    src="/${src#$root/}"
     if [[ $src -ef $target ]]; then
       # hrmm, this is weird. we're probably looking at a file or directory
       # that was bound into a chroot from the host machine. Ignore it,
@@ -455,7 +443,7 @@ findmnt -Recvruno SOURCE,TARGET,FSTYPE,OPTIONS,FSROOT "$root" |
   printf '\t%-10s' "/$(mangle "${target#/}")" "$fstype" "$opts"
   printf '\t%s %s' "$dump" "$pass"
   printf '\n\n'
-done
+done < <(findmnt -Recvruno SOURCE,TARGET,FSTYPE,OPTIONS,FSROOT "$root")
 
 # handle swaps devices
 {
@@ -470,6 +458,9 @@ done
 
     # skip files marked deleted by the kernel
     [[ $device = *'\040(deleted)' ]] && continue
+
+    # skip devices not part of the prefix
+    [[ $device = "$prefixfilter"* ]] || continue
 
     if [[ $type = file ]]; then
       printf '%-20s' "${device#${root%/}}"
